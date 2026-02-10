@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-Convert XML + XSLT -> XHTML -> PDF using lxml + xhtml2pdf
+XML + XSLT -> XHTML (lxml) -> PDF (xhtml2pdf) with CSS sanitization
 
 Install:
   pip install lxml xhtml2pdf
 """
 
+import re
 import sys
 from pathlib import Path
-from lxml import etree
+from lxml import etree, html
 from xhtml2pdf import pisa
 
 
+# ----------------------------
+# 1) XML + XSLT -> XHTML
+# ----------------------------
 def xml_xsl_to_xhtml(xml_path: Path, xsl_path: Path) -> str:
-    """
-    Apply XSLT to XML and return XHTML string.
-    """
     parser = etree.XMLParser(
         resolve_entities=False,
         no_network=True,
@@ -23,7 +24,6 @@ def xml_xsl_to_xhtml(xml_path: Path, xsl_path: Path) -> str:
         huge_tree=False,
         remove_blank_text=False,
     )
-
     xml_doc = etree.parse(str(xml_path), parser)
     xsl_doc = etree.parse(str(xsl_path), parser)
 
@@ -33,48 +33,139 @@ def xml_xsl_to_xhtml(xml_path: Path, xsl_path: Path) -> str:
     return str(result)
 
 
-def xhtml_to_pdf(xhtml: str, pdf_path: Path, base_dir: Path):
+# ----------------------------
+# 2) XHTML sanitization for xhtml2pdf
+# ----------------------------
+def _sanitize_css_text(css: str) -> str:
     """
-    Convert XHTML string to PDF.
+    Remove CSS constructs that frequently crash xhtml2pdf's CSS parser.
+    This targets the exact @page parsing path that throws NotImplementedType.
     """
-    def link_callback(uri, rel):
-        # Resolve relative paths for images, css, etc.
-        path = (base_dir / uri).resolve()
-        return str(path) if path.exists() else uri
+
+    # Remove @page and @page:* blocks (most common crash)
+    css = re.sub(r"@page\s*[^{}]*\{(?:[^{}]|\{[^{}]*\})*\}", "", css, flags=re.I | re.S)
+
+    # Remove @font-face blocks (sometimes breaks depending on syntax)
+    css = re.sub(r"@font-face\s*\{(?:[^{}]|\{[^{}]*\})*\}", "", css, flags=re.I | re.S)
+
+    # Remove other at-rules that xhtml2pdf often can't parse
+    css = re.sub(r"@supports\s*[^{}]*\{(?:[^{}]|\{[^{}]*\})*\}", "", css, flags=re.I | re.S)
+    css = re.sub(r"@media\s*[^{}]*\{(?:[^{}]|\{[^{}]*\})*\}", "", css, flags=re.I | re.S)
+    css = re.sub(r"@keyframes\s*[^{}]*\{(?:[^{}]|\{[^{}]*\})*\}", "", css, flags=re.I | re.S)
+
+    # Remove properties that are frequently problematic (keep it conservative)
+    css = re.sub(r"(?i)\bdisplay\s*:\s*flex\s*;?", "", css)
+    css = re.sub(r"(?i)\bposition\s*:\s*fixed\s*;?", "", css)
+
+    return css
+
+
+def sanitize_xhtml_for_xhtml2pdf(xhtml: str, drop_all_css: bool = False) -> str:
+    """
+    - If drop_all_css=True: remove <style> and <link rel="stylesheet"> entirely.
+    - Otherwise: sanitize CSS inside <style> blocks to avoid parser crashes.
+    """
+    # Parse as HTML fragment/doc robustly
+    doc = html.fromstring(xhtml)
+
+    # Remove external stylesheets optionally (xhtml2pdf may fetch them poorly anyway)
+    for link in doc.xpath("//link[translate(@rel,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')='stylesheet']"):
+        link.getparent().remove(link)
+
+    style_nodes = doc.xpath("//style")
+
+    if drop_all_css:
+        for st in style_nodes:
+            st.getparent().remove(st)
+        return html.tostring(doc, encoding="unicode", method="html")
+
+    # Sanitize embedded CSS
+    for st in style_nodes:
+        css_text = st.text or ""
+        st.text = _sanitize_css_text(css_text)
+
+    return html.tostring(doc, encoding="unicode", method="html")
+
+
+# ----------------------------
+# 3) XHTML -> PDF (xhtml2pdf)
+# ----------------------------
+def xhtml_to_pdf(xhtml: str, pdf_path: Path, base_dir: Path) -> None:
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def link_callback(uri: str, rel: str) -> str:
+        # Convert file:// URIs to paths
+        if uri.startswith("file://"):
+            uri = uri.replace("file://", "")
+
+        # Try resolving relative paths against base_dir
+        candidate = (base_dir / uri).resolve()
+        if candidate.exists():
+            return str(candidate)
+
+        return uri  # fallback
 
     with open(pdf_path, "wb") as f:
-        pisa.CreatePDF(
+        result = pisa.CreatePDF(
             src=xhtml,
             dest=f,
             encoding="utf-8",
             link_callback=link_callback,
         )
 
+    if result.err:
+        raise RuntimeError("xhtml2pdf reported errors while generating PDF.")
 
+
+# ----------------------------
+# Main with fallback strategy
+# ----------------------------
 def main():
     if len(sys.argv) != 4:
-        print("Usage: python convert.py input.xml style.xsl output.pdf")
+        print("Usage: python3 final_test.py input.xml style.xsl output.pdf")
         sys.exit(1)
 
-    xml_path = Path(sys.argv[1]).resolve()
-    xsl_path = Path(sys.argv[2]).resolve()
-    pdf_path = Path(sys.argv[3]).resolve()
+    xml_path = Path(sys.argv[1]).expanduser().resolve()
+    xsl_path = Path(sys.argv[2]).expanduser().resolve()
+    pdf_path = Path(sys.argv[3]).expanduser().resolve()
 
     if not xml_path.exists():
-        raise FileNotFoundError(xml_path)
+        raise FileNotFoundError(f"XML not found: {xml_path}")
     if not xsl_path.exists():
-        raise FileNotFoundError(xsl_path)
+        raise FileNotFoundError(f"XSL not found: {xsl_path}")
 
-    # Step 1: XML + XSL → XHTML
-    xhtml = xml_xsl_to_xhtml(xml_path, xsl_path)
+    base_dir = xml_path.parent
 
-    # (Optional but VERY useful for debugging)
-    # Path("debug.xhtml").write_text(xhtml, encoding="utf-8")
+    # 1) Transform
+    raw_xhtml = xml_xsl_to_xhtml(xml_path, xsl_path)
 
-    # Step 2: XHTML → PDF
-    xhtml_to_pdf(xhtml, pdf_path, base_dir=xml_path.parent)
+    # Optional debug: save raw XHTML exactly as produced by XSLT
+    # (base_dir / "debug_raw.xhtml").write_text(raw_xhtml, encoding="utf-8")
 
-    print(f"✅ PDF generated: {pdf_path}")
+    # 2) First attempt: sanitize common crashing CSS (@page etc.)
+    try:
+        cleaned = sanitize_xhtml_for_xhtml2pdf(raw_xhtml, drop_all_css=False)
+        # (base_dir / "debug_cleaned.xhtml").write_text(cleaned, encoding="utf-8")
+        xhtml_to_pdf(cleaned, pdf_path, base_dir)
+        print(f"✅ PDF generated (sanitized CSS): {pdf_path}")
+        return
+    except Exception as e:
+        sys.stderr.write(f"[WARN] First attempt failed: {e}\n")
+
+    # 3) Fallback: drop ALL CSS (brutal but usually produces a PDF)
+    try:
+        cleaned2 = sanitize_xhtml_for_xhtml2pdf(raw_xhtml, drop_all_css=True)
+        # (base_dir / "debug_nocss.xhtml").write_text(cleaned2, encoding="utf-8")
+        xhtml_to_pdf(cleaned2, pdf_path, base_dir)
+        print(f"✅ PDF generated (NO CSS fallback): {pdf_path}")
+        return
+    except Exception as e:
+        sys.stderr.write(f"[ERROR] Fallback failed too: {e}\n")
+        sys.stderr.write(
+            "xhtml2pdf likely cannot handle this XHTML/CSS. "
+            "At this point, WeasyPrint/Chromium is the practical option.\n"
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":
