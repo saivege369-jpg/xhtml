@@ -59,3 +59,200 @@ keep using xhtml2pdf with aggressive sanitization (but you already saw how britt
 
 
 If you tell me what OS this is (Amazon Linux 2? RHEL 7? CentOS 7?), I can tailor the exact micromamba commands and avoid any package mismatches.
+
+
+
+
+
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# XML + XSL to PDF Conversion – Investigation Summary
+
+## Objective
+
+Convert **client-provided XML + XSL** into **PDF** using Python, **without modifying XML or XSL**.
+
+---
+
+## Initial Requirements & Constraints
+
+* XML and XSL are **owned by the client** → cannot change them
+* Solution must run in a **restricted Linux environment** (no sudo)
+* Prefer a **pure-Python pipeline** if possible
+
+---
+
+## Solution Paths Tried
+
+### 0. XML + XSL → XSL-FO → PDF using **Apache FOP**
+
+**Pipeline**
+
+```
+XML + XSL → XSL-FO → PDF (Apache FOP)
+```
+
+**Why This Was Tried**
+
+* Apache FOP is the *correct* engine when XSL produces **XSL-FO**
+* Very common in healthcare / clinical document pipelines
+* Stable, standards-based FO rendering
+
+**Outcome**
+
+* Java-based execution via Apache FOP was tested
+* PDF generation worked at a basic level
+
+**Issues Encountered**
+
+* Requires **Java runtime** and FOP binaries
+* Harder to embed cleanly into an existing Python-only pipeline
+* Operational overhead (managing Java, FOP configs, fonts)
+* Environment constraints made long-term maintenance undesirable
+
+**Conclusion**
+⚠️ Technically correct for FO, but **operationally heavy** for this setup
+
+---
+
+### 1. XML + XSL → XHTML → PDF using **xhtml2pdf**
+
+**Pipeline**
+
+```
+XML + XSL (lxml) → XHTML → PDF (xhtml2pdf)
+```
+
+**Outcome**
+
+* XHTML generation via `lxml` works correctly
+* PDF generation **fails repeatedly** due to CSS parsing errors
+
+**Errors Observed**
+
+* `NotImplementedType object is not iterable`
+* `Invalid color value 'collapse'`
+* `invalid literal for int() with base 10: '100%'`
+
+**Root Cause**
+
+* `xhtml2pdf` has **very limited and buggy CSS support**
+* Client XSL emits modern / complex CSS such as:
+
+  * `@page` rules
+  * `border-collapse: collapse`
+  * percentage-based widths (`width: 100%`)
+
+**Mitigations Attempted**
+
+* Python-side XHTML/CSS sanitization:
+
+  * strip `@page`, `@font-face`, `@media`
+  * remove `border-collapse`, `%` widths, `position: fixed`
+* Aggressive fallback: remove **all CSS**
+
+**Result**
+
+* Even with heavy sanitization, `xhtml2pdf` remains **unstable and brittle**
+* Usable PDF generation is **not reliable**
+
+**Conclusion**
+❌ `xhtml2pdf` is **not suitable** for this stylesheet
+
+---
+
+### 2. XML + XSL → XHTML → PDF using **WeasyPrint 52.5**
+
+**Pipeline**
+
+```
+XML + XSL (lxml) → XHTML → PDF (WeasyPrint)
+```
+
+**Why WeasyPrint**
+
+* Modern CSS support
+* Proper handling of `@page`, tables, percentages
+* Much closer to browser-quality rendering
+
+**Outcome**
+
+* Python code is correct
+* Fails at runtime with native library error
+
+**Error Observed**
+
+```
+undefined symbol: pango_context_set_round_glyph_positions
+```
+
+**Root Cause**
+
+* System has **old Pango (libpango-1.0.so.0)**
+* WeasyPrint 52.5 requires **newer Pango**
+* Cannot upgrade system libraries without sudo
+
+**Proposed Fix (Not Yet Applied)**
+
+* Install WeasyPrint + Pango via **micromamba / conda** in user space
+* This avoids system libraries entirely
+
+**Status**
+⚠️ Blocked pending approval / ability to use micromamba or conda
+
+---
+
+### 3. Chromium / Playwright (Discussed, Not Implemented)
+
+**Pipeline**
+
+```
+XML + XSL → XHTML → PDF (Headless Chromium)
+```
+
+**Pros**
+
+* Full HTML/CSS support
+* No dependency on Pango
+* Very high rendering fidelity
+
+**Cons**
+
+* Requires Node.js + Chromium runtime
+* Heavier than Python-only solutions
+
+**Status**
+🟡 Considered as a fallback option
+
+---
+
+## Current Status (Where We Are Stuck)
+
+* ❌ `xhtml2pdf` cannot reliably handle the client’s XHTML/CSS
+* ⚠️ WeasyPrint code works but is blocked by **outdated system Pango**
+* 🔒 Cannot change XML, XSL, or system libraries
+
+---
+
+## Recommended Next Steps
+
+### Preferred (Cleanest)
+
+✅ Use **micromamba / conda** to run WeasyPrint 52.5 with bundled native libs
+
+### Acceptable Alternative
+
+✅ Use **Playwright / Chromium** for HTML → PDF
+
+### Not Recommended
+
+❌ Further investment in `xhtml2pdf`
+
+---
+
+## Final Recommendation
+
+For long-term stability and correctness **without touching client XSL**:
+
+> **WeasyPrint (via micromamba/conda) or Chromium-based PDF rendering is required.**
+
+Anything else will remain fragile and high-maintenance.
