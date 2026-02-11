@@ -1,258 +1,148 @@
-Yep — that WeasyPrint error is not your code. It’s your Linux system library.
-What the error means
-You have this at the bottom:
+Below are complete Linux steps (no sudo) using Micromamba, plus complete working code (XML+XSL → XHTML → PDF using WeasyPrint 52.5). This avoids the Pango symbol error by bundling Pango/Cairo inside the env.
 
-undefined symbol: pango_context_set_round_glyph_positions
-
-WeasyPrint calls a function that exists only in newer Pango.
-But your machine is loading an older /lib64/libpango-1.0.so.0, so the symbol isn’t there → crash.
-So the fix is: use a newer Pango (without changing XML/XSL).
-
-Best fix without sudo: install WeasyPrint + Pango via Conda (in your home directory)
-This avoids system packages completely and works on locked-down servers.
-Option A) Micromamba (smallest, no sudo)
-# 1) Download micromamba into your home dir
+A) Complete Linux setup (Micromamba, no sudo)
+1) Install micromamba into ~/bin
+cd ~
 curl -L https://micro.mamba.pm/api/micromamba/linux-64/latest -o micromamba.tar.bz2
 tar -xjf micromamba.tar.bz2
+
 mkdir -p ~/bin
 mv bin/micromamba ~/bin/
 export PATH=~/bin:$PATH
 
-# 2) Create env with weasyprint + correct native libs
+2) Enable micromamba activate in your shell (bash)
+eval "$(micromamba shell hook -s bash)"
+
+
+If you want this permanently (so you don’t re-run it every time), add this line to ~/.bashrc:
+
+echo 'export PATH=~/bin:$PATH' >> ~/.bashrc
+echo 'eval "$(micromamba shell hook -s bash)"' >> ~/.bashrc
+source ~/.bashrc
+
+3) Create a WeasyPrint environment with bundled native libs
 micromamba create -y -n wp -c conda-forge \
-  python=3.10 weasyprint=52.5 pango cairo gdk-pixbuf libffi harfbuzz fontconfig
+  python=3.10 \
+  weasyprint=52.5 \
+  lxml \
+  pango cairo harfbuzz gdk-pixbuf libffi fontconfig
 
+4) Activate the environment
 micromamba activate wp
 
-# 3) Run your script
-python convert_weasy.py hcamockedccd.xml HealowStylesheet.xsl output.pdf
+5) Verify (this is the key check)
+python -m weasyprint --info
 
-If micromamba activate doesn’t work in your shell, do:
-eval "$(~/bin/micromamba shell hook -s bash)"
+
+You should see output including:
+
+WeasyPrint version: 52.5
+
+Pango version: 1.44+ (often 1.50+)
+
+and it should not be using /lib64/libpango-1.0.so.0
+
+B) Complete code: convert_weasy.py
+
+Save this as convert_weasy.py:
+
+#!/usr/bin/env python3
+"""
+Convert XML + XSLT -> XHTML (lxml) -> PDF (WeasyPrint 52.5)
+
+Usage:
+  python convert_weasy.py input.xml style.xsl output.pdf
+
+Notes:
+- Does NOT modify XML or XSL.
+- Uses base_url so relative images/CSS referenced by the generated XHTML resolve.
+"""
+
+import sys
+from pathlib import Path
+from lxml import etree
+from weasyprint import HTML
+
+
+def xml_xsl_to_xhtml(xml_path: Path, xsl_path: Path) -> str:
+    """Apply XSLT to XML and return XHTML as a string."""
+    parser = etree.XMLParser(
+        resolve_entities=False,
+        no_network=True,
+        recover=False,
+        huge_tree=False,
+        remove_blank_text=False,
+    )
+
+    xml_doc = etree.parse(str(xml_path), parser)
+    xsl_doc = etree.parse(str(xsl_path), parser)
+
+    transform = etree.XSLT(xsl_doc)
+    result = transform(xml_doc)
+
+    return str(result)
+
+
+def xhtml_to_pdf(xhtml: str, pdf_path: Path, base_url: str) -> None:
+    """Render XHTML string to PDF with WeasyPrint."""
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    HTML(string=xhtml, base_url=base_url).write_pdf(str(pdf_path))
+
+
+def main() -> int:
+    if len(sys.argv) != 4:
+        print("Usage: python convert_weasy.py input.xml style.xsl output.pdf")
+        return 2
+
+    xml_path = Path(sys.argv[1]).expanduser().resolve()
+    xsl_path = Path(sys.argv[2]).expanduser().resolve()
+    pdf_path = Path(sys.argv[3]).expanduser().resolve()
+
+    if not xml_path.exists():
+        print(f"ERROR: XML not found: {xml_path}", file=sys.stderr)
+        return 1
+    if not xsl_path.exists():
+        print(f"ERROR: XSL not found: {xsl_path}", file=sys.stderr)
+        return 1
+
+    # 1) XML + XSL -> XHTML
+    xhtml = xml_xsl_to_xhtml(xml_path, xsl_path)
+
+    # Optional: write the generated XHTML for debugging
+    # debug_path = xml_path.parent / "debug.xhtml"
+    # debug_path.write_text(xhtml, encoding="utf-8")
+
+    # 2) XHTML -> PDF
+    # base_url is important for resolving relative URLs in <img src="...">, <link href="...">, etc.
+    base_url = str(xml_path.parent)
+    xhtml_to_pdf(xhtml, pdf_path, base_url)
+
+    print(f"✅ PDF generated: {pdf_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+C) Run the conversion
+
+From the same folder (or give full paths):
+
 micromamba activate wp
+python convert_weasy.py input.xml style.xsl output.pdf
 
-Option B) Miniconda (bigger but common)
-Install Miniconda in ~/miniconda3, then:
-conda create -y -n wp -c conda-forge \
-  python=3.10 weasyprint=52.5 pango cairo gdk-pixbuf libffi harfbuzz fontconfig
-conda activate wp
-python convert_weasy.py hcamockedccd.xml HealowStylesheet.xsl output.pdf
+D) If assets (images/css) are not found
 
+WeasyPrint resolves relative paths based on:
 
-Quick verify you’re not using the old system Pango
-After activating the env:
-python -c "import weasyprint; print('weasyprint ok')"
-python -c "import ctypes.util; print(ctypes.util.find_library('pango-1.0'))"
+base_url = str(xml_path.parent)
 
-You want it to resolve to the conda env, not /lib64/....
 
-If you absolutely can’t use conda/micromamba
-Then WeasyPrint won’t run on that machine unless IT upgrades Pango.
-In that case, your realistic options are:
+So ensure any referenced assets are reachable relative to the XML’s directory.
 
+If your assets live elsewhere, change base_url to that folder, e.g.:
 
-Playwright/Chromium HTML→PDF (Chromium is bundled, usually no sudo needed)
+base_url = "/path/to/assets"
 
 
-keep using xhtml2pdf with aggressive sanitization (but you already saw how brittle it is)
-
-
-
-If you tell me what OS this is (Amazon Linux 2? RHEL 7? CentOS 7?), I can tailor the exact micromamba commands and avoid any package mismatches.
-
-
-
-
-
---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-# XML + XSL to PDF Conversion – Investigation Summary
-
-## Objective
-
-Convert **client-provided XML + XSL** into **PDF** using Python, **without modifying XML or XSL**.
-
----
-
-## Initial Requirements & Constraints
-
-* XML and XSL are **owned by the client** → cannot change them
-* Solution must run in a **restricted Linux environment** (no sudo)
-* Prefer a **pure-Python pipeline** if possible
-
----
-
-## Solution Paths Tried
-
-### 0. XML + XSL → XSL-FO → PDF using **Apache FOP**
-
-**Pipeline**
-
-```
-XML + XSL → XSL-FO → PDF (Apache FOP)
-```
-
-**Why This Was Tried**
-
-* Apache FOP is the *correct* engine when XSL produces **XSL-FO**
-* Very common in healthcare / clinical document pipelines
-* Stable, standards-based FO rendering
-
-**Outcome**
-
-* Java-based execution via Apache FOP was tested
-* PDF generation worked at a basic level
-
-**Issues Encountered**
-
-* Requires **Java runtime** and FOP binaries
-* Harder to embed cleanly into an existing Python-only pipeline
-* Operational overhead (managing Java, FOP configs, fonts)
-* Environment constraints made long-term maintenance undesirable
-
-**Conclusion**
-⚠️ Technically correct for FO, but **operationally heavy** for this setup
-
----
-
-### 1. XML + XSL → XHTML → PDF using **xhtml2pdf**
-
-**Pipeline**
-
-```
-XML + XSL (lxml) → XHTML → PDF (xhtml2pdf)
-```
-
-**Outcome**
-
-* XHTML generation via `lxml` works correctly
-* PDF generation **fails repeatedly** due to CSS parsing errors
-
-**Errors Observed**
-
-* `NotImplementedType object is not iterable`
-* `Invalid color value 'collapse'`
-* `invalid literal for int() with base 10: '100%'`
-
-**Root Cause**
-
-* `xhtml2pdf` has **very limited and buggy CSS support**
-* Client XSL emits modern / complex CSS such as:
-
-  * `@page` rules
-  * `border-collapse: collapse`
-  * percentage-based widths (`width: 100%`)
-
-**Mitigations Attempted**
-
-* Python-side XHTML/CSS sanitization:
-
-  * strip `@page`, `@font-face`, `@media`
-  * remove `border-collapse`, `%` widths, `position: fixed`
-* Aggressive fallback: remove **all CSS**
-
-**Result**
-
-* Even with heavy sanitization, `xhtml2pdf` remains **unstable and brittle**
-* Usable PDF generation is **not reliable**
-
-**Conclusion**
-❌ `xhtml2pdf` is **not suitable** for this stylesheet
-
----
-
-### 2. XML + XSL → XHTML → PDF using **WeasyPrint 52.5**
-
-**Pipeline**
-
-```
-XML + XSL (lxml) → XHTML → PDF (WeasyPrint)
-```
-
-**Why WeasyPrint**
-
-* Modern CSS support
-* Proper handling of `@page`, tables, percentages
-* Much closer to browser-quality rendering
-
-**Outcome**
-
-* Python code is correct
-* Fails at runtime with native library error
-
-**Error Observed**
-
-```
-undefined symbol: pango_context_set_round_glyph_positions
-```
-
-**Root Cause**
-
-* System has **old Pango (libpango-1.0.so.0)**
-* WeasyPrint 52.5 requires **newer Pango**
-* Cannot upgrade system libraries without sudo
-
-**Proposed Fix (Not Yet Applied)**
-
-* Install WeasyPrint + Pango via **micromamba / conda** in user space
-* This avoids system libraries entirely
-
-**Status**
-⚠️ Blocked pending approval / ability to use micromamba or conda
-
----
-
-### 3. Chromium / Playwright (Discussed, Not Implemented)
-
-**Pipeline**
-
-```
-XML + XSL → XHTML → PDF (Headless Chromium)
-```
-
-**Pros**
-
-* Full HTML/CSS support
-* No dependency on Pango
-* Very high rendering fidelity
-
-**Cons**
-
-* Requires Node.js + Chromium runtime
-* Heavier than Python-only solutions
-
-**Status**
-🟡 Considered as a fallback option
-
----
-
-## Current Status (Where We Are Stuck)
-
-* ❌ `xhtml2pdf` cannot reliably handle the client’s XHTML/CSS
-* ⚠️ WeasyPrint code works but is blocked by **outdated system Pango**
-* 🔒 Cannot change XML, XSL, or system libraries
-
----
-
-## Recommended Next Steps
-
-### Preferred (Cleanest)
-
-✅ Use **micromamba / conda** to run WeasyPrint 52.5 with bundled native libs
-
-### Acceptable Alternative
-
-✅ Use **Playwright / Chromium** for HTML → PDF
-
-### Not Recommended
-
-❌ Further investment in `xhtml2pdf`
-
----
-
-## Final Recommendation
-
-For long-term stability and correctness **without touching client XSL**:
-
-> **WeasyPrint (via micromamba/conda) or Chromium-based PDF rendering is required.**
-
-Anything else will remain fragile and high-maintenance.
+If your shell is not bash (e.g., csh/tcsh), tell me which one and I’ll give the exact activation commands for that shell too.
